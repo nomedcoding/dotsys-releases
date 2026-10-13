@@ -1,0 +1,3 @@
+# 공휴일 봇 작업 부산물 — 커밋 금지
+node_modules/
+.holidays-commit-msg

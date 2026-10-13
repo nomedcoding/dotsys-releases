@@ -1,0 +1,176 @@
+# 공휴일 표 자동 갱신 봇 (ADR-124 공휴일 데이터 채널 추기 — 운영 기본값 = 봇 자동 갱신, 사람은 예외 알림만)
+#
+# 하는 일: 매일 상류 패키지 @hyunbinseo/holidays-kr(관보 기반)의 최신판을 받아 → 앱과 같은 규칙 + 그럴듯함 검사로
+#          검증하고 → holidays.json 이 실제로 바뀐 날에만 커밋한다. 바뀐 게 없으면 아무것도 안 한다(커밋 0).
+#
+# 비용: 공개 저장소의 GitHub 호스티드 러너 = 무료. 그래도 ubuntu 고정 — 혹시 비공개로 바뀌면 분 단가가
+#       가장 싸다(windows 2배·macOS 10배). windows/macos 러너로 바꾸지 말 것.
+#
+# 주기: 매일 03:17 KST(= 18:17 UTC). 상류는 정부의 임시공휴일 지정을 보통 0~6일 안에 싣는다 —
+#       매일 당기면 실린 다음 날 아침에는 게시돼 있다. 바뀐 날만 커밋하므로 매일 돌려도 저장소는 조용하다.
+#       정시(:00)를 피한 이유: GitHub 예약 실행은 정시 혼잡 때 늦거나 드물게 건너뛴다(공식 안내). 건너뛰어도
+#       다음 날 실행이 따라잡는다.
+#
+# 실패 = 메일: 어느 단계든 실패하면 GitHub 가 이 워크플로를 만든 계정(마지막으로 cron 을 고친 계정)에
+#       "Run failed" 메일을 보낸다. 그게 사람이 개입하는 유일한 지점이다 — 평소엔 할 일이 없다.
+#       대처법 = HOLIDAYS.md "실패하면".
+#
+# 구조(왜 잡이 둘인가): 매일 @latest 로 받는 외부 패키지 코드를 실행하는 잡(build)에는 **읽기 권한만** 준다.
+#       이 저장소는 데스크탑 설치 파일(Releases)·공지 피드도 담고 있어서, 쓰기 토큰이 있는 곳에서 외부 코드를
+#       돌리면 상류 패키지가 오염됐을 때 피해가 공휴일 표 밖으로 번진다. 쓰기 권한 잡(publish)은 외부 코드를
+#       전혀 실행하지 않고, build 가 만든 holidays.json 후보만 우리 스크립트(--verify)로 다시 검사해 커밋한다.
+#
+# 액션은 태그가 아니라 **커밋 SHA 로 고정**한다(태그는 옮겨질 수 있다). 2026-10-06 에 각 저장소의 v4 태그가
+# 가리키던 커밋을 읽기 전용 API 로 확인해 적었다. 올릴 때는 같은 방법으로 새 SHA 를 확인할 것.
+
+name: holidays
+
+on:
+  schedule:
+    - cron: '17 18 * * *' # 03:17 KST 매일
+  workflow_dispatch: # 웹 UI 의 Actions → holidays → Run workflow (overrides 를 고친 뒤 즉시 반영할 때)
+    inputs:
+      allow_rename:
+        description: '이름 변경 허용 — 실패 메일이 "이름이 어긋나는 날짜" 였고, 그 개명이 맞을 때만 체크(이번 한 번만)'
+        type: boolean
+        default: false
+      allow_remove:
+        description: '날짜 삭제 허용 — 실패 메일이 "날짜가 사라짐" 이었고, 그 삭제가 맞을 때만 체크(이번 한 번만)'
+        type: boolean
+        default: false
+      allow_bulk:
+        description: '한꺼번에 많이 허용 — 실패 메일이 "한 번에 너무 많이 늘어남" 이었고, 로그의 + 줄이 전부 맞을 때만 체크(이번 한 번만)'
+        type: boolean
+        default: false
+      upstream_version:
+        description: '상류 패키지 버전 — 평소 latest 그대로. 상류 형식 변경으로 봇이 멈춘 동안 긴급 추가가 필요할 때만 holidays.json 의 source 줄 버전(예: 5.2027.2)'
+        type: string
+        default: latest
+
+# 기본 권한 0 — 잡마다 필요한 것만 연다.
+permissions: {}
+
+# 겹치는 실행 금지(앞 실행이 끝날 때까지 다음은 대기, 취소하지 않음).
+concurrency:
+  group: holidays
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: 상류 → 후보 생성·검증 (읽기 전용)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.gen.outputs.changed }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 = v4.4.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false # 이 잡은 푸시하지 않는다 — 토큰을 .git/config 에 남기지 않음
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4 = v4.4.0
+        with:
+          node-version: 22
+
+      # 저장소에 package.json 이 없다 — 임시 node_modules 에만 설치(.gitignore). 설치 스크립트는 실행하지 않는다.
+      # 예약 실행은 항상 latest. 수동 실행에서만 버전 고정 가능(상류 형식 변경 때의 비상구).
+      - name: 상류 패키지 설치
+        env:
+          UPSTREAM_VERSION: ${{ inputs.upstream_version }}
+        run: |
+          v="${UPSTREAM_VERSION:-latest}"
+          if ! printf '%s' "$v" | grep -Eq '^(latest|[0-9][0-9A-Za-z.+-]{0,39})$'; then
+            echo "::error::upstream_version 은 latest 또는 5.2027.2 같은 버전 번호만 받는다: $v"
+            exit 1
+          fi
+          npm install --no-save --no-package-lock --omit=dev --ignore-scripts --no-audit --no-fund "@hyunbinseo/holidays-kr@$v"
+
+      - name: 표 생성·검증
+        id: gen
+        env:
+          ALLOW_RENAME: ${{ inputs.allow_rename }}
+          ALLOW_REMOVE: ${{ inputs.allow_remove }}
+          ALLOW_BULK: ${{ inputs.allow_bulk }}
+        run: |
+          args=()
+          if [ "${ALLOW_RENAME:-false}" = "true" ]; then args+=(--allow-rename); fi
+          if [ "${ALLOW_REMOVE:-false}" = "true" ]; then args+=(--allow-remove); fi
+          if [ "${ALLOW_BULK:-false}" = "true" ]; then args+=(--allow-bulk); fi
+          node scripts/build-holidays.mjs "${args[@]}"
+
+      - name: 후보 전달
+        if: steps.gen.outputs.changed == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 = v4.6.2
+        with:
+          name: holidays-candidate
+          path: holidays.json
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: 후보 재검증·커밋 (외부 코드 실행 없음)
+    needs: build
+    if: needs.build.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 = v4.4.0
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4 = v4.4.0
+        with:
+          node-version: 22
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4 = v4.3.0
+        with:
+          name: holidays-candidate
+          path: ${{ runner.temp }}/candidate
+
+      # 상류 패키지 없이(npm install 안 함) 우리 스크립트만으로: 앱 검증기 규칙·정규 직렬화·단조성·overrides 반영·
+      # 그럴듯함(도장 범위·늘어나는 양·제어문자)을 다시 확인한 뒤 holidays.json 으로 들이고 커밋 메시지를 만든다.
+      - name: 후보 재검증
+        env:
+          ALLOW_RENAME: ${{ inputs.allow_rename }}
+          ALLOW_REMOVE: ${{ inputs.allow_remove }}
+          ALLOW_BULK: ${{ inputs.allow_bulk }}
+        run: |
+          args=()
+          if [ "${ALLOW_RENAME:-false}" = "true" ]; then args+=(--allow-rename); fi
+          if [ "${ALLOW_REMOVE:-false}" = "true" ]; then args+=(--allow-remove); fi
+          if [ "${ALLOW_BULK:-false}" = "true" ]; then args+=(--allow-bulk); fi
+          node scripts/build-holidays.mjs --verify "$RUNNER_TEMP/candidate/holidays.json" "${args[@]}"
+
+      # push 가 거절되면(그사이 사람이 overrides·공지 등을 커밋해 원격이 앞섬) 1회만: fetch → rebase → 재push.
+      # 단 그사이 원격에서 holidays.json 자체가 바뀌었으면 섞지 않고 실패(검증하지 않은 합본을 게시하지 않는다).
+      - name: 바뀐 날만 커밋·푸시
+        run: |
+          git config user.name "dotsys-holidays-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add holidays.json
+          if git diff --cached --quiet; then
+            echo "holidays: 커밋할 변경 없음"
+            exit 0
+          fi
+          git commit -F .holidays-commit-msg
+          if git push; then
+            exit 0
+          fi
+          branch="${GITHUB_REF_NAME:-main}"
+          echo "::warning::push 거절 — 원격이 앞서 있다. 1회 fetch+rebase 후 재시도"
+          base="$(git rev-parse HEAD^)"
+          git fetch origin "$branch"
+          if ! git diff --quiet "$base" FETCH_HEAD -- holidays.json; then
+            echo "::error::그사이 원격에서 holidays.json 이 바뀌었다 — 섞지 않고 멈춘다. 다음 실행이 새 상태에서 다시 만든다"
+            exit 1
+          fi
+          if ! git rebase FETCH_HEAD; then
+            git rebase --abort || true
+            echo "::error::rebase 충돌 — 멈춘다"
+            exit 1
+          fi
+          git push origin "HEAD:$branch"

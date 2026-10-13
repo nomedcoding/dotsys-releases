@@ -1,0 +1,5 @@
+{
+  "note": "상류(@hyunbinseo/holidays-kr)가 아직 못 실은 임시공휴일을 먼저 넣을 때만 add 에 한 줄(예: \"2027-10-02\": [\"임시공휴일\"]). 잘못 실린 날짜 회수는 remove 에 날짜. 고친 뒤 Actions → holidays → Run workflow. holidays.json 은 손으로 고치지 말 것 — 사용법은 HOLIDAYS.md.",
+  "add": {},
+  "remove": []
+}
